@@ -14,4 +14,5 @@ desc: |
   指令：
   /暖暖日程、/暖暖总览、/查询卡池 蝴蝶套、/查询卡池 1.0、/查询卡池 1.0双四、/查询卡池 常驻、/暖暖绑定 手机号、/暖暖验证码 验证码、/暖暖密码登录 账号 密码、/暖暖解绑、/暖暖帮助
 version: 1.0.0
-author: 自定义
+author: ningxi-csu
+repo:https://github.com/ningxi-csu/astrbot_plugin_nikki_note
