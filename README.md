@@ -59,7 +59,7 @@
 
 ```bash
 cd /path/to/AstrBot/data/plugins
-git clone https://github.com/你的用户名/astrbot_plugin_nikki_note.git
+git clone https://github.com/ningxi-csu/astrbot_plugin_nikki_note.git
 ```
 
 然后在 AstrBot 管理面板重载插件（或重启 AstrBot），依赖会自动安装。
