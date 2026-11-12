@@ -392,6 +392,8 @@ class NikkiNotePlugin(Star):
             yield event.plain_result('二维码已过期，请重新发送：/暖暖绑定b站')
         finally:
             self._bili_pending.discard(qq)
+
+    @filter.command("暖暖日程")
     async def schedule(self, event: AstrMessageEvent):
         """查看当前绑定的账号日程；群聊、私聊均可"""
         qq = str(event.get_sender_id())
