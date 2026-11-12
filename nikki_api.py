@@ -37,6 +37,13 @@ DATA_DIR = os.path.join(BASE_DIR, 'data')
 DEVICE_FILE = os.path.join(DATA_DIR, 'device.json')
 _device_lock = threading.Lock()
 
+
+def set_data_dir(path: str):
+    """由插件入口指定持久化目录（AstrBot 的 data/plugin_data/<插件名>）"""
+    global DATA_DIR, DEVICE_FILE
+    DATA_DIR = os.fspath(path)
+    DEVICE_FILE = os.path.join(DATA_DIR, 'device.json')
+
 PASSPORT = 'https://passport.papegames.com'
 API = 'https://myl-api.nuanpaper.com'
 TIME_API = 'https://chaos.papegames.com/system/time'

@@ -7,8 +7,8 @@ AstrBot 插件：无限暖暖 · 奇想手账日程便利贴
   - 绑定后在群聊或私聊发送 /暖暖日程 查看自己的日程
   - 登录态过期时自动用 refresh_token 续期；续期失败才要求重新绑定
 
-数据保存在插件目录的 data/users.json，按 QQ 号隔离；
-data/device.json 是通行证设备标识，必须稳定，不要手动删除。
+持久化数据按上架规范保存在 AstrBot 的 data/plugin_data/astrbot_plugin_nikki_note/
+目录（users.json 按 QQ 号隔离）；device.json 是通行证设备标识，必须稳定，不要手动删除。
 """
 import asyncio
 import json
@@ -31,8 +31,21 @@ try:
 except ImportError:  # pragma: no cover
     import nikki_api as nikki
 
-DATA_DIR = os.path.join(BASE_DIR, 'data')
+PLUGIN_NAME = 'astrbot_plugin_nikki_note'
+
+
+def _plugin_data_dir() -> str:
+    """持久化目录：按上架规范使用 data/plugin_data/<插件名>/"""
+    try:
+        from astrbot.core.star.star_tools import StarTools
+        return os.fspath(StarTools.get_data_dir(PLUGIN_NAME))
+    except Exception:  # 旧版 AstrBot 或脱离 AstrBot 运行时的回退
+        return os.path.join(BASE_DIR, 'data')
+
+
+DATA_DIR = _plugin_data_dir()
 USERS_FILE = os.path.join(DATA_DIR, 'users.json')
+nikki.set_data_dir(DATA_DIR)
 
 # ---- 可调参数 ----
 CACHE_TTL = 60           # 同一账号的数据缓存秒数，避免群友频繁查询放大请求

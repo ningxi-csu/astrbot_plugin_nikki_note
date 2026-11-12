@@ -74,23 +74,25 @@ git clone https://github.com/你的用户名/astrbot_plugin_nikki_note.git
 
 ## 数据文件说明
 
-插件运行后会在自身 `data` 目录生成以下文件：
+插件运行后会在 AstrBot 的 `data/plugin_data/astrbot_plugin_nikki_note/` 目录生成以下文件（符合插件上架规范，便于数据迁移与审计）：
 
 | 文件 | 作用 | 备注 |
 | --- | --- | --- |
-| `data/users.json` | 各 QQ 号的登录态（nid / token / refresh_token） | 含敏感信息，请勿泄露 |
-| `data/device.json` | 通行证设备标识（DOID / web_deviceid） | 必须保持稳定，删除会导致已发验证码失效，请勿手动删除 |
+| `data/plugin_data/astrbot_plugin_nikki_note/users.json` | 各 QQ 号的登录态（nid / token / refresh_token） | 含敏感信息，请勿泄露 |
+| `data/plugin_data/astrbot_plugin_nikki_note/device.json` | 通行证设备标识（DOID / web_deviceid） | 必须保持稳定，删除会导致已发验证码失效，请勿手动删除 |
+
+> 从旧版本升级：把原插件目录 `data/` 下的 `users.json` 和 `device.json` 移动（不要复制后再保留旧文件）到上述目录即可，已绑定的账号和发了验证码的设备标识都能继续使用。
 
 ## 常见问题
 
 **Q：验证码明明正确，绑定却提示失败（1005）？**
-通行证接口校验设备标识，发送验证码和登录必须使用同一个 DOID / web_deviceid。本插件已自动持久化设备标识，请不要在绑定流程中途删除 `data/device.json`。
+通行证接口校验设备标识，发送验证码和登录必须使用同一个 DOID / web_deviceid。本插件已自动持久化设备标识，请不要在绑定流程中途删除 `device.json`。
 
 **Q：登录态会过期吗？**
 token 过期时会自动用 refresh_token 续期，整体有效期约 60 天。仅当 refresh_token 也失效时才会提示重新绑定。
 
 **Q：手机号会被泄露吗？**
-绑定指令仅允许私聊使用；登录态只保存在机器人服务器的插件目录，不会上传到任何第三方。
+绑定指令仅允许私聊使用；登录态只保存在机器人服务器的 `data/plugin_data/astrbot_plugin_nikki_note/` 目录，不会上传到任何第三方。
 
 ## 免责声明
 
