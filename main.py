@@ -45,6 +45,7 @@ def _plugin_data_dir() -> str:
 
 DATA_DIR = _plugin_data_dir()
 USERS_FILE = os.path.join(DATA_DIR, 'users.json')
+BILI_USERS_FILE = os.path.join(DATA_DIR, 'bili_users.json')
 nikki.set_data_dir(DATA_DIR)
 
 # ---- 可调参数 ----
@@ -55,6 +56,7 @@ QUERY_COOLDOWN = 10      # 每个 QQ 的查询冷却秒数
 SMS_COOLDOWN = 60        # 每个 QQ 发送验证码的冷却，防止短信轰炸
 PENDING_TTL = 300        # 绑定流程保留时间；短信验证码实际 3 分钟有效
 TIME_SYNC_TTL = 300      # 服务器时间偏移缓存秒数
+BILI_QR_TTL = 170        # B 站二维码轮询时长；二维码实际 180 秒有效
 
 HELP_TEXT = """无限暖暖 · 奇想手账
 
@@ -67,6 +69,7 @@ HELP_TEXT = """无限暖暖 · 奇想手账
 /暖暖绑定 手机号  私聊绑定自己的账号（短信验证码）
 /暖暖验证码 验证码  私聊完成绑定
 /暖暖密码登录 账号 密码  私聊用账号密码直接绑定
+/暖暖绑定b站      私聊扫码登录 B 站并关联游戏数据
 /暖暖解绑        私聊解除绑定
 
 绑定需要接收短信验证码，请在与机器人的私聊中操作。"""
@@ -84,6 +87,8 @@ class NikkiNotePlugin(Star):
         super().__init__(context)
         self._lock = threading.Lock()
         self._users = self._load_users()   # {qq: {nid, token, refresh_token, account}}
+        self._bili_users = self._load_bili_users()  # {qq: B 站账号信息与 Cookie}
+        self._bili_pending = set()         # 正在等待扫码的 QQ
         self._pending = {}                 # {qq: (phone, 发送时间)} 绑定中的手机号
         self._last_sms = {}                # {qq: 上次发送验证码时间}
         self._last_query = {}              # {qq: 上次查询时间}
@@ -109,6 +114,20 @@ class NikkiNotePlugin(Star):
         with self._lock:
             with open(USERS_FILE, 'w', encoding='utf-8') as f:
                 json.dump(self._users, f, ensure_ascii=False, indent=2)
+
+    def _load_bili_users(self) -> dict:
+        try:
+            with open(BILI_USERS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_bili_users(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with self._lock:
+            with open(BILI_USERS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(self._bili_users, f, ensure_ascii=False, indent=2)
 
     # ---------------- 工具 ----------------
     @staticmethod
@@ -177,6 +196,14 @@ class NikkiNotePlugin(Star):
 
         self._gacha_cache[cache_key] = (time.time(), text)
         return text, session
+
+    @staticmethod
+    def _expired_hint(user: dict) -> str:
+        """登录失效提示：按绑定来源给出对应指令"""
+        if user.get('account') == 'bilibili':
+            return ('登录已失效（B 站扫码登录有效期约 8 天），请私聊重新扫码：\n'
+                    '/暖暖绑定b站')
+        return '登录已失效且自动续期失败，请私聊重新绑定：\n/暖暖绑定 手机号'
 
     @staticmethod
     def _markdown_result(event: AstrMessageEvent, text: str):
@@ -286,7 +313,85 @@ class NikkiNotePlugin(Star):
             '现在可以在群里或私聊发送 /暖暖日程 查看日程。'
         )
 
-    @filter.command("暖暖日程")
+    @filter.command("暖暖绑定b站")
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def bind_bilibili(self, event: AstrMessageEvent):
+        """私聊扫码绑定 B 站账号：发送登录二维码并等待扫码确认"""
+        qq = str(event.get_sender_id())
+        if qq in self._bili_pending:
+            yield event.plain_result('已有待扫码的二维码，请先完成扫码或等待其失效。')
+            return
+        self._bili_pending.add(qq)
+        try:
+            try:
+                qr = await asyncio.to_thread(nikki.bili_qr_generate)
+                image_path = os.path.join(DATA_DIR, 'qrcode', f'bili_{qq}.png')
+                await asyncio.to_thread(nikki.make_qr_image, qr['url'], image_path)
+            except nikki.NikkiError as exc:
+                yield event.plain_result(str(exc))
+                return
+
+            yield event.image_result(image_path)
+            yield event.plain_result(
+                '请使用 B 站手机客户端扫码，并在手机上确认授权。\n'
+                '二维码约 3 分钟有效，过期后请重新发送：/暖暖绑定b站'
+            )
+
+            deadline = time.time() + BILI_QR_TTL
+            announced = False
+            while time.time() < deadline:
+                await asyncio.sleep(2)
+                try:
+                    state, account = await asyncio.to_thread(
+                        nikki.bili_qr_poll, qr['qrcode_key'])
+                except nikki.NikkiError as exc:
+                    logger.warning(f'B 站扫码轮询失败 qq={qq}: {exc}')
+                    continue
+
+                if state == 'waiting':
+                    continue
+                if state == 'scanned':
+                    if not announced:
+                        announced = True
+                        yield event.plain_result('已扫码，请在手机上点击“确认授权”。')
+                    continue
+                if state == 'expired':
+                    yield event.plain_result('二维码已失效，请重新发送：/暖暖绑定b站')
+                    return
+
+                if not account:
+                    yield event.plain_result('扫码成功，但未查询到账号信息。')
+                    return
+                with self._lock:
+                    self._bili_users[qq] = account
+                self._save_bili_users()
+                summary = [nikki.format_bili_account(account)]
+
+                # 用 B 站登录态换叠纸登录态，成功后可继续使用全部查询指令
+                try:
+                    session, has_game = await asyncio.to_thread(
+                        nikki.bili_login_game, account.get('cookies') or {})
+                except nikki.NikkiError as exc:
+                    summary.append(f'\n已绑定 B 站账号，但获取游戏数据失败：{exc}')
+                    yield event.plain_result('\n'.join(summary))
+                    return
+
+                if not has_game:
+                    summary.append('\n未查询到账号信息：该 B 站账号尚未绑定无限暖暖游戏角色。')
+                    yield event.plain_result('\n'.join(summary))
+                    return
+
+                with self._lock:
+                    self._users[qq] = session
+                self._save_users()
+                summary.append(f'\n游戏数据绑定成功。\n搭配师编号：{session["nid"]}')
+                summary.append('现在可以使用 /暖暖日程、/暖暖总览、/查询卡池')
+                yield event.plain_result('\n'.join(summary))
+                return
+
+            yield event.plain_result('二维码已过期，请重新发送：/暖暖绑定b站')
+        finally:
+            self._bili_pending.discard(qq)
     async def schedule(self, event: AstrMessageEvent):
         """查看当前绑定的账号日程；群聊、私聊均可"""
         qq = str(event.get_sender_id())
@@ -306,9 +411,7 @@ class NikkiNotePlugin(Star):
         try:
             card, session = await asyncio.to_thread(self._fetch_card, qq, user)
         except nikki.SessionExpired:
-            yield event.plain_result(
-                '登录已失效且自动续期失败，请私聊重新绑定：\n/暖暖绑定 手机号'
-            )
+            yield event.plain_result(self._expired_hint(user))
             return
         except Exception as exc:  # 网络、接口异常等，仅向用户返回简短原因
             logger.warning(f'暖暖日程查询失败 qq={qq}: {exc}')
@@ -337,9 +440,7 @@ class NikkiNotePlugin(Star):
         try:
             text, _session = await asyncio.to_thread(self._fetch_overview, qq, user)
         except nikki.SessionExpired:
-            yield event.plain_result(
-                '登录已失效且自动续期失败，请私聊重新绑定：\n/暖暖绑定 手机号'
-            )
+            yield event.plain_result(self._expired_hint(user))
             return
         except Exception as exc:
             logger.warning(f'暖暖总览查询失败 qq={qq}: {exc}')
@@ -376,9 +477,7 @@ class NikkiNotePlugin(Star):
         try:
             text, _session = await asyncio.to_thread(self._fetch_gacha, qq, user, query)
         except nikki.SessionExpired:
-            yield event.plain_result(
-                '登录已失效且自动续期失败，请私聊重新绑定：\n/暖暖绑定 手机号'
-            )
+            yield event.plain_result(self._expired_hint(user))
             return
         except nikki.NikkiError as exc:
             yield event.plain_result(str(exc))

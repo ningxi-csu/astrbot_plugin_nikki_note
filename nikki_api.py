@@ -879,3 +879,219 @@ def fetch_gacha_with_refresh(session: dict, query: str):
         _gm, self_data = fetch_note_book_full(session)
         suits = fetch_suit_catalog(session)
     return build_gacha_query(query, self_data, suits), session
+
+
+# ---------------- B 站扫码登录 ----------------
+BILI_PASSPORT = 'https://passport.bilibili.com'
+BILI_API = 'https://api.bilibili.com'
+
+BILI_HEADERS = {
+    'User-Agent': HEADERS['User-Agent'],
+    'Referer': 'https://www.bilibili.com/',
+    'Origin': 'https://www.bilibili.com',
+}
+
+
+def bili_qr_generate() -> dict:
+    """申请登录二维码，返回 {url, qrcode_key}"""
+    try:
+        resp = requests.get(BILI_PASSPORT + '/x/passport-login/web/qrcode/generate',
+                            headers=BILI_HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise NikkiError(f'获取 B 站二维码失败：{exc}') from exc
+    if data.get('code') != 0 or not (data.get('data') or {}).get('qrcode_key') \
+            or not (data.get('data') or {}).get('url'):
+        raise NikkiError(f"获取 B 站二维码失败：{data.get('message') or data.get('code')}")
+    return data['data']
+
+
+def make_qr_image(text: str, path: str) -> str:
+    """把二维码内容渲染成 PNG 文件，返回路径"""
+    try:
+        import qrcode
+    except ImportError as exc:
+        raise NikkiError('缺少 qrcode 依赖，请先安装：pip install "qrcode[pil]"') from exc
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    qrcode.make(text).save(path)
+    return path
+
+
+def bili_qr_poll(qrcode_key: str):
+    """轮询扫码状态，返回 (状态, 账号信息)
+
+    状态：waiting 未扫码 / scanned 已扫码待确认 / success 成功 / expired 已失效
+    """
+    http = requests.Session()
+    try:
+        resp = http.get(BILI_PASSPORT + '/x/passport-login/web/qrcode/poll',
+                        params={'qrcode_key': qrcode_key},
+                        headers=BILI_HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise NikkiError(f'查询扫码状态失败：{exc}') from exc
+
+    if data.get('code') != 0:
+        raise NikkiError(f"查询扫码状态失败：{data.get('message') or data.get('code')}")
+    inner = data.get('data') or {}
+    code = inner.get('code')
+    if code == 86101:
+        return 'waiting', None
+    if code == 86090:
+        return 'scanned', None
+    if code == 86038:
+        return 'expired', None
+    if code != 0:
+        raise NikkiError(f"扫码登录失败：{inner.get('message') or code}")
+    return 'success', bili_account_info(http)
+
+
+def bili_relation_stat(http: requests.Session, mid: str):
+    """关注/粉丝数来自关系接口，nav 接口不返回这两个字段"""
+    try:
+        resp = http.get(BILI_API + '/x/relation/stat', params={'vmid': mid},
+                        headers=BILI_HEADERS, timeout=15)
+        resp.raise_for_status()
+        data = resp.json().get('data') or {}
+        return int(data.get('follower') or 0), int(data.get('following') or 0)
+    except (requests.RequestException, ValueError, TypeError):
+        return None, None
+
+
+def bili_account_info(http: requests.Session):
+    """用登录后的 Cookie 拉取账号信息；未登录返回 None"""
+    try:
+        resp = http.get(BILI_API + '/x/web-interface/nav', headers=BILI_HEADERS, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise NikkiError(f'获取 B 站账号信息失败：{exc}') from exc
+
+    data = payload.get('data') or {}
+    if payload.get('code') == -101 or not data.get('isLogin'):
+        return None
+    level = data.get('level_info') or {}
+    mid = str(data.get('mid') or '')
+    followers, following = bili_relation_stat(http, mid)
+    return {
+        'mid': mid,
+        'name': data.get('uname') or '',
+        'level': int(level.get('current_level') or 0),
+        'coins': data.get('money'),
+        'following': following,
+        'followers': followers,
+        'sign': data.get('sign') or '',
+        'vip': int(data.get('vipStatus') or 0) == 1,
+        'cookies': http.cookies.get_dict(),
+    }
+
+
+# 叠纸在 B 站的 OAuth 应用；扫码登录后用它换取叠纸账号登录态
+BILI_OAUTH_CLIENT_ID = 'd4aee5996857435b'
+BILI_OAUTH_WRAPPER = (
+    'https://shared.torrealcielo.com/libs/bilibili_login_v2.html'
+    '?blibili_id=' + BILI_OAUTH_CLIENT_ID +
+    '&clientid=' + str(CLIENT_ID) +
+    '&api_env=prod&return_url=' +
+    urllib.parse.quote('https://myl.nuanpaper.com/tools/journal', safe='')
+)
+PAPEGAMES_BILI_TOKEN = 'https://oid2roid.papegames.com/bilibili/v1/token'
+
+
+def _jwt_claims(token: str) -> dict:
+    """解析 JWT 载荷（不校验签名）"""
+    segment = token.split('.')[1]
+    segment += '=' * (-len(segment) % 4)
+    return json.loads(base64.urlsafe_b64decode(segment))
+
+
+def bili_login_game(cookies: dict):
+    """用 B 站网页登录 Cookie 换取叠纸登录态，并检测是否绑定游戏角色
+
+    返回 (session, 是否有游戏数据)
+    """
+    http = requests.Session()
+    http.headers.update(BILI_HEADERS)
+    for name, value in (cookies or {}).items():
+        http.cookies.set(name, value, domain='.bilibili.com', path='/')
+
+    try:
+        scope = http.get(BILI_API + '/x/account-oauth2/v1/scope',
+                         params={'client_id': BILI_OAUTH_CLIENT_ID}, timeout=15).json()
+    except (requests.RequestException, ValueError) as exc:
+        raise NikkiError(f'获取 B 站授权信息失败：{exc}') from exc
+    scopes = ','.join(item.get('scope', '')
+                      for item in ((scope.get('data') or {}).get('scopes') or [])
+                      if item.get('scope'))
+    if not scopes:
+        raise NikkiError(f"获取 B 站授权信息失败：{scope.get('message') or scope.get('code')}")
+
+    try:
+        auth = http.post(BILI_API + '/x/account-oauth2/v1/authorize', data={
+            'client_id': BILI_OAUTH_CLIENT_ID,
+            'scopes': scopes,
+            'state': '',
+            'session_id': str(int(time.time() * 1000)),
+            'return_url': BILI_OAUTH_WRAPPER,
+            'csrf': http.cookies.get('bili_jct', ''),
+        }, timeout=15).json()
+    except (requests.RequestException, ValueError) as exc:
+        raise NikkiError(f'B 站授权失败：{exc}') from exc
+    if auth.get('code') != 0:
+        raise NikkiError(f"B 站授权失败：{auth.get('message') or auth.get('code')}")
+
+    redirect = (auth.get('data') or {}).get('redirect_url') or ''
+    codes = urllib.parse.parse_qs(urllib.parse.urlparse(redirect).query).get('code') or []
+    if not codes:
+        raise NikkiError('B 站授权失败：未获取到授权码')
+
+    try:
+        exchange = requests.post(PAPEGAMES_BILI_TOKEN,
+                                 data={'clientid': str(CLIENT_ID), 'code': codes[0]},
+                                 headers=BILI_HEADERS, timeout=20).json()
+    except (requests.RequestException, ValueError) as exc:
+        raise NikkiError(f'换取叠纸账号失败：{exc}') from exc
+    if exchange.get('ret') != 0 or not exchange.get('token'):
+        raise NikkiError(f"换取叠纸账号失败：{exchange.get('msg') or exchange.get('ret')}")
+
+    claims = _jwt_claims(exchange['token'])
+    session = {
+        'nid': str(claims.get('diezhi_nid') or ''),
+        'token': claims.get('diezhi_token') or '',
+        'refresh_token': '',
+        'account': 'bilibili',
+    }
+    if not session['nid'] or not session['token']:
+        raise NikkiError('换取叠纸账号失败：登录态不完整')
+
+    try:
+        gm, _ = fetch_note_book_full(session)
+    except NikkiError:
+        return session, False
+    return session, bool(gm)
+
+
+def format_bili_account(account: dict) -> str:
+    """B 站账号信息文本"""
+    def count(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return '未知'
+        return f'{value:g}' if isinstance(value, float) else str(value)
+
+    lines = [
+        'B 站绑定成功',
+        f"昵称：{account.get('name') or '未知'}",
+        f"UID：{account.get('mid') or '未知'}",
+        f"等级：LV{account.get('level') or 0}"
+        + ('｜大会员' if account.get('vip') else ''),
+        f"硬币：{count(account.get('coins'))}｜"
+        f"关注：{count(account.get('following'))}｜"
+        f"粉丝：{count(account.get('followers'))}",
+    ]
+    if account.get('sign'):
+        lines.append(f"签名：{account['sign']}")
+    return '\n'.join(lines)
